@@ -1,0 +1,307 @@
+---
+title: "Untitled"
+output: html_document
+date: "2025-11-22"
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+
+library(dplyr)
+
+data <- read.csv("Final_data.csv")
+
+names(data)
+```
+
+
+
+
+```{r}
+key_vars <- c(
+  "Age", "Gender", "Height..m.", "Weight..kg.",
+  "Resting_BPM", "Avg_BPM", "Max_BPM",
+  "Workout_Type", "Session_Duration..hours.", 
+  "Workout_Frequency..days.week.", "Experience_Level", "Difficulty.Level",
+  "BMI", "Fat_Percentage", "lean_mass_kg",
+  "Calories", "Carbs", "Proteins", "Fats", "Water_Intake..liters.",
+  "meal_type", "diet_type", "sugar_g", "sodium_mg", "cholesterol_mg",
+  "pct_maxHR", "cal_balance", "expected_burn", "protein_per_kg", "BMI_calc", "Calories_Burned"
+)
+
+data_filtered <- data[, key_vars, drop = FALSE]
+
+
+ivs <- c(
+  "Age", "Gender", "Height..m.", "Weight..kg.",
+  "Resting_BPM", "Avg_BPM", "Max_BPM",
+  "Workout_Type", "Session_Duration..hours.", 
+  "Workout_Frequency..days.week.", "Experience_Level", "Difficulty.Level",
+  "BMI", "Fat_Percentage", "lean_mass_kg",
+  "Calories", "Carbs", "Proteins", "Fats", "Water_Intake..liters.",
+   "meal_type", "diet_type", "sugar_g", "sodium_mg", "cholesterol_mg",
+  "pct_maxHR", "cal_balance", "expected_burn", "protein_per_kg", "BMI_calc"
+)
+
+```
+
+
+
+
+```{r}
+
+
+library(glmnet)
+
+
+
+y <- data_filtered$Calories_Burned
+
+# model.matrix will automatically dummy-code factor variables
+X <- model.matrix(
+  Calories_Burned ~ .,
+  data = data_filtered[, c("Calories_Burned", ivs)]
+)[, -1]  # remove intercept column
+
+# Optional sanity checks
+dim(X)
+length(y)
+
+
+# 1. Fit ridge model with all IVs to obtain a lambda grid
+
+
+ridge_fit <- glmnet(
+  x = X,
+  y = y,
+  alpha = 0,          # ridge
+  standardize = TRUE  # standardize predictors before fitting
+)
+
+# Lambda grid used by glmnet
+lambda_grid <- ridge_fit$lambda
+
+
+# 2. Choose lambda using an Information Criterion (AIC-style)
+
+# Number of observations
+n <- nrow(X)
+
+# 2.1 Fitted values for each lambda on the full data
+#     predict() returns an n x length(lambda) matrix
+y_hat_mat <- predict(ridge_fit, newx = X)
+
+# 2.2 Sum of squared residuals for each lambda
+resid_mat  <- sweep(y_hat_mat, 1, y, FUN = "-")  # residuals = y_hat - y
+SSR_lambda <- colSums(resid_mat^2)
+
+# 2.3 Effective degrees of freedom for ridge:
+#     df(lambda) = sum_j d_j^2 / (d_j^2 + lambda),
+#     where d_j are the singular values of X
+svd_X <- svd(X)
+d     <- svd_X$d
+
+df_lambda <- sapply(lambda_grid, function(lam) {
+  sum(d^2 / (d^2 + lam))
+})
+
+# 2.4 AIC-like information criterion for each lambda
+IC_lambda <- log(SSR_lambda / (n - df_lambda)) + (2 * df_lambda / n)
+
+# 2.5 Select lambda that minimizes the IC
+idx_ic    <- which.min(IC_lambda)
+lambda_ic <- lambda_grid[idx_ic]
+
+lambda_ic  # lambda chosen by the IC criterion
+log(lambda_ic)
+# Plot IC as a function of lambda
+plot(log(lambda_grid), IC_lambda, type = "l",
+     xlab = "log(lambda)", ylab = "IC (AIC-style)")
+abline(v = log(lambda_ic), col = "red", lty = 2)
+
+
+#3. Cross-validation on the same lambda grid
+
+
+set.seed(123)  # for reproducible CV splits
+
+cv_ridge_ic <- cv.glmnet(
+  x = X,
+  y = y,
+  alpha = 0,             # ridge
+  lambda = lambda_grid,  # use the same lambda grid as ridge_fit
+  nfolds = 10,
+  standardize = TRUE,
+  type.measure = "mse"
+)
+
+# Plot CV curve and mark the IC-based lambda
+plot(cv_ridge_ic)
+abline(v = log(lambda_ic), col = "red", lty = 2)  # IC-based lambda
+
+# Lambda chosen purely by cross-validation (minimum CV MSE)
+lambda_cv_min <- cv_ridge_ic$lambda.min
+lambda_cv_min
+
+
+# 4. Fit final ridge model at the IC-chosen lambda
+
+ridge_final_ic <- glmnet(
+  x = X,
+  y = y,
+  alpha = 0,
+  lambda = lambda_ic,
+  standardize = TRUE
+)
+
+# Coefficients at lambda_ic
+coef_final_ic <- coef(ridge_final_ic)
+coef_final_ic
+
+coef_df_ic <- data.frame( variable = rownames(coef_final_ic), coef = as.numeric(coef_final_ic) ) # Remove intercept and sort by absolute coefficient size 
+coef_df_ic <- subset(coef_df_ic, variable != "(Intercept)") 
+coef_df_ic <- coef_df_ic[order(-abs(coef_df_ic$coef)), ] 
+head(coef_df_ic, 30)
+```
+
+
+
+```{r}
+
+# 5. Model Fit Metrics for Ridge Regression
+
+# 5.1 Get fitted values and residuals
+y_hat <- predict(ridge_final_ic, newx = X)
+residuals <- as.numeric(y - y_hat)
+
+# 5.2 Compute standard metrics
+SSE <- sum(residuals^2)
+SST <- sum((y - mean(y))^2)
+R2 <- 1 - SSE/SST
+RMSE <- sqrt(mean(residuals^2))
+MAE <- mean(abs(residuals))
+
+# Adj R2 is NOT strictly valid for ridge, 
+# but sometimes reported for comparability:
+adj_R2 <- 1 - (SSE/(n - df_lambda[idx_ic])) / (SST/(n - 1))
+
+# 5.3 AIC and BIC using ridge df
+AIC_ridge <- n * log(SSE/n) + 2 * df_lambda[idx_ic]
+BIC_ridge <- n * log(SSE/n) + log(n) * df_lambda[idx_ic]
+
+# 5.4 Wrap into a table
+model_fit_summary <- data.frame(
+  Metric = c("SSE", "SST", "R2", "Adjusted R2", "RMSE", "MAE",
+             "AIC (ridge df)", "BIC (ridge df)", 
+             "lambda (IC)", "log(lambda)"),
+  Value  = c(SSE, SST, R2, adj_R2, RMSE, MAE,
+             AIC_ridge, BIC_ridge,
+             lambda_ic, log(lambda_ic))
+)
+
+model_fit_summary
+
+```
+
+
+
+
+
+
+```{r}
+library(ggplot2)
+
+coef_plot_df <- coef_df_ic[1:15, ]  # top 15
+
+ggplot(coef_plot_df,
+       aes(x = reorder(variable, abs(coef)),
+           y = coef,
+           fill = abs(coef))) +     # color by absolute coefficient
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  scale_fill_gradient(
+    low = "#FFFF00",   # light red
+    high = "#0000FF"   # strong purple
+  ) +
+  labs(
+    title = "Top 15 Ridge Coefficients (Standardized)",
+    x = "",
+    y = "Coefficient",
+    fill = "|coef|"
+  ) +
+  theme_minimal(base_size = 13)
+
+```
+
+
+
+
+
+
+
+```{r}
+
+# 6. Get fitted values and residuals from final ridge model
+
+
+# Fitted values from ridge model at lambda_ic
+y_hat <- as.numeric(predict(ridge_final_ic, newx = X, s = lambda_ic))
+
+# Residuals
+resid <- y - y_hat
+
+
+# 5 Linearity & homoscedasticity: residual vs fitted plot
+
+plot(y_hat, resid,
+     xlab = "Fitted values", ylab = "Residuals",
+     main = "Residuals vs Fitted (Ridge)")
+abline(h = 0, col = "red", lty = 2)
+
+# Interpretation:
+# - Random cloud around 0 → linearity ok, no strong pattern
+# - Funnel shape / clear curve → possible nonlinearity or heteroscedasticity
+
+
+# Normality of residuals
+
+qqnorm(resid, main = "Normal Q-Q Plot of Residuals")
+qqline(resid, col = "red")
+
+
+
+
+# 5.3 Homoscedasticity (Breusch-Pagan style test using lm on residuals)
+
+#install.packages("lmtest")
+library(lmtest)
+
+bp_mod <- lm(resid^2 ~ y_hat)  # simple proxy: variance ~ fitted
+bptest(bp_mod)
+
+# H0: homoscedasticity; small p-value → evidence of heteroscedasticity
+
+
+
+# H0: no first-order autocorrelation; small p-value → autocorrelation problem
+
+#--------------------------------------------------
+# 5.5 (Optional) Influence / outliers check via standardized residuals
+#--------------------------------------------------
+resid_std <- scale(resid)  # standardized residuals
+hist(resid_std,
+     main = "Standardized residuals",
+     xlab = "Std residuals")
+
+# Rule-of-thumb: |std residual| > 3 → potential outliers
+
+```
+
+
+
+
+
+
+
+
+
